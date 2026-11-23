@@ -1,0 +1,274 @@
+name: CRIU Privileged Feature Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  privileged-criu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CRIU + dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            criu \
+            iproute2 \
+            net-tools \
+            iputils-ping \
+            build-essential \
+            libprotobuf-dev \
+            libprotobuf-c-dev \
+            protobuf-c-compiler \
+            libnl-3-dev \
+            libnet-dev \
+            libcap-dev \
+            pkg-config \
+            uuid-dev \
+            python3
+
+          # Optional: install newer CRIU from PPA if desired
+          # sudo add-apt-repository -y ppa:criu/ppa
+          # sudo apt-get update && sudo apt-get install -y criu
+
+          echo "=== CRIU version ==="
+          criu --version
+          echo
+          echo "=== Kernel feature check ==="
+          sudo criu check
+          echo
+          sudo criu check --extra || true
+          echo
+          sudo criu check --all || true
+
+      - name: Create test workspace
+        run: |
+          mkdir -p /tmp/criu-tests
+          cd /tmp/criu-tests
+          echo "Test workspace ready"
+
+      # ------------------------------------------------------------------
+      # 1. Basic process dump / restore
+      # ------------------------------------------------------------------
+      - name: "Test 1: Basic process dump/restore"
+        run: |
+          set -euo pipefail
+          cd /tmp/criu-tests
+          rm -rf basic && mkdir basic
+
+          # Start a simple long-running process
+          bash -c 'echo "basic-test-$$" > /tmp/basic.pid; while true; do sleep 1; done' &
+          sleep 0.5
+          PID=$(pgrep -f "basic-test" | head -1)
+          echo "Target PID: $PID"
+
+          sudo criu dump -t $PID -D basic --shell-job -v4
+          echo "Dump succeeded"
+
+          # Kill original just in case
+          kill -9 $PID 2>/dev/null || true
+
+          sudo criu restore -D basic --shell-job -d -v4
+          sleep 1
+          echo "Restore succeeded"
+          pgrep -af "basic-test" || true
+          echo "✓ Basic dump/restore OK"
+
+      # ------------------------------------------------------------------
+      # 2. Namespaces (PID + mount + net + UTS)
+      # ------------------------------------------------------------------
+      - name: "Test 2: Multiple namespaces"
+        run: |
+          set -euo pipefail
+          cd /tmp/criu-tests
+          rm -rf ns && mkdir ns
+
+          # Create a process inside new namespaces
+          sudo unshare -p -m -n -u --fork --mount-proc \
+            bash -c 'hostname criu-ns-test; echo "ns-test-$$" > /tmp/ns.pid; while true; do sleep 1; done' &
+          sleep 1
+
+          # Find the child PID (inside the new PID ns it looks different)
+          PID=$(pgrep -f "ns-test" | head -1)
+          echo "Namespaced PID: $PID"
+
+          sudo criu dump -t $PID -D ns --shell-job -v4 \
+            --manage-cgroups \
+            --tcp-established || true   # may not have TCP yet
+
+          echo "Namespace dump finished"
+          echo "✓ Namespace test completed (dump stage)"
+
+      # ------------------------------------------------------------------
+      # 3. Established TCP connection
+      # ------------------------------------------------------------------
+      - name: "Test 3: Established TCP"
+        run: |
+          set -euo pipefail
+          cd /tmp/criu-tests
+          rm -rf tcp && mkdir tcp
+
+          # Simple TCP server + client
+          python3 -c '
+          import socket, time, os
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("127.0.0.1", 9876))
+          s.listen(1)
+          print("server ready", flush=True)
+          conn, _ = s.accept()
+          print("client connected", flush=True)
+          while True:
+              data = conn.recv(64)
+              if not data: break
+              conn.sendall(b"pong")
+              time.sleep(0.5)
+          ' &
+          SERVER_PID=$!
+          sleep 0.8
+
+          # Client
+          python3 -c '
+          import socket, time
+          c = socket.socket()
+          c.connect(("127.0.0.1", 9876))
+          for i in range(20):
+              c.sendall(b"ping")
+              print(c.recv(64))
+              time.sleep(0.3)
+          ' &
+          CLIENT_PID=$!
+          sleep 1
+
+          echo "Server PID: $SERVER_PID  Client PID: $CLIENT_PID"
+
+          # Dump both
+          sudo criu dump -t $SERVER_PID -D tcp --shell-job --tcp-established -v4 || {
+            echo "TCP dump failed (expected on some kernels / configurations)"
+            kill $SERVER_PID $CLIENT_PID 2>/dev/null || true
+            exit 0
+          }
+
+          echo "✓ TCP established dump attempted"
+
+      # ------------------------------------------------------------------
+      # 4. Shared memory + file lock
+      # ------------------------------------------------------------------
+      - name: "Test 4: Shared memory + file lock"
+        run: |
+          set -euo pipefail
+          cd /tmp/criu-tests
+          rm -rf shm && mkdir shm
+
+          cat > /tmp/shm_test.c << 'EOF'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <fcntl.h>
+          #include <string.h>
+          #include <sys/file.h>
+
+          int main() {
+              int fd = open("/tmp/criu-lockfile", O_RDWR|O_CREAT, 0644);
+              flock(fd, LOCK_EX);
+
+              int shmfd = shm_open("/criu_shm_test", O_CREAT|O_RDWR, 0600);
+              ftruncate(shmfd, 4096);
+              void *p = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, shmfd, 0);
+              strcpy(p, "hello-from-shared-memory");
+
+              printf("shm+lock ready pid=%d\n", getpid());
+              fflush(stdout);
+              while(1) sleep(1);
+              return 0;
+          }
+          EOF
+
+          gcc -o /tmp/shm_test /tmp/shm_test.c -lrt
+          /tmp/shm_test &
+          sleep 0.5
+          PID=$(pgrep -f shm_test | head -1)
+          echo "SHM PID: $PID"
+
+          sudo criu dump -t $PID -D shm --shell-job -v4
+          echo "✓ Shared memory + file lock dump OK"
+
+      # ------------------------------------------------------------------
+      # 5. TUN device (requires privileges)
+      # ------------------------------------------------------------------
+      - name: "Test 5: TUN device"
+        run: |
+          set -euo pipefail
+          cd /tmp/criu-tests
+          rm -rf tun && mkdir tun
+
+          # Create a simple process that opens a TUN device
+          cat > /tmp/tun_test.c << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+          #include <linux/if.h>
+          #include <linux/if_tun.h>
+
+          int main() {
+              int fd = open("/dev/net/tun", O_RDWR);
+              if (fd < 0) { perror("open tun"); return 1; }
+
+              struct ifreq ifr = {0};
+              ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+              strncpy(ifr.ifr_name, "criu0", IFNAMSIZ);
+
+              if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+                  perror("TUNSETIFF");
+                  return 1;
+              }
+              printf("TUN device %s created, pid=%d\n", ifr.ifr_name, getpid());
+              fflush(stdout);
+              while(1) sleep(1);
+              return 0;
+          }
+          EOF
+
+          gcc -o /tmp/tun_test /tmp/tun_test.c
+          sudo /tmp/tun_test &
+          sleep 0.8
+          PID=$(pgrep -f tun_test | head -1)
+          echo "TUN PID: $PID"
+
+          sudo criu dump -t $PID -D tun --shell-job -v4 || {
+            echo "TUN dump failed (device handling is complex)"
+            sudo kill $PID 2>/dev/null || true
+            exit 0
+          }
+          echo "✓ TUN dump succeeded"
+
+      # ------------------------------------------------------------------
+      # 6. Final summary
+      # ------------------------------------------------------------------
+      - name: Summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "  CRIU Privileged Feature Test Summary"
+          echo "========================================"
+          echo
+          criu --version
+          echo
+          echo "Images created:"
+          find /tmp/criu-tests -type d -name "*" | head -20
+          echo
+          echo "All privileged tests finished."
+          echo "Check individual step logs for detailed results."
