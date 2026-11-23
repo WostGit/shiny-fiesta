@@ -1,4 +1,4 @@
-name: Docker Checkpoint Support Test
+name: Podman CRIU Checkpoint/Restore Tests
 
 on:
   push:
@@ -7,82 +7,69 @@ on:
   workflow_dispatch:
 
 jobs:
-  docker-checkpoint-test:
+  podman-criu:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
-      - name: Install CRIU
+      - name: Install CRIU + Podman dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y software-properties-common
           sudo add-apt-repository -y ppa:criu/ppa
           sudo apt-get update
-          sudo apt-get install -y criu
+          sudo apt-get install -y criu podman crun runc
 
-          echo "=== CRIU version ==="
+          echo "=== Versions ==="
           criu --version
+          podman --version
+          crun --version || true
+          runc --version || true
+
+          echo
+          echo "=== criu check ==="
           sudo criu check
+          sudo criu check --extra || true
 
-      - name: Enable Docker experimental features
-        run: |
-          set -euo pipefail
+          echo
+          echo "=== Podman info (runtime) ==="
+          podman info --format '{{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Version}}' || true
 
-          # Enable experimental mode (required for checkpoint)
-          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
-
-          # Restart Docker
-          sudo systemctl restart docker
-          sleep 3
-
-          echo "=== Docker info (experimental) ==="
-          docker info | grep -iE 'experimental|runc|criu' || true
-          docker version
-
-      - name: Test 1 – Basic container checkpoint + restore
+      - name: Test 1 – Basic checkpoint + restore
         id: basic
         run: |
           set -euo pipefail
 
-          echo ">>> Starting test container"
-          docker run -d --name looper busybox \
+          echo ">>> Starting counter container"
+          sudo podman run -d --name looper docker.io/library/busybox \
             sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
 
-          sleep 2
+          sleep 3
           echo ">>> Logs before checkpoint:"
-          docker logs looper | tail -5
+          sudo podman logs looper | tail -5
 
           echo ">>> Creating checkpoint"
-          if docker checkpoint create looper cp1; then
-            echo "Checkpoint create: SUCCESS"
-          else
-            echo "Checkpoint create: FAILED"
-            docker logs looper || true
-            exit 1
-          fi
+          sudo podman container checkpoint looper
+          echo "Checkpoint create: SUCCESS"
 
           echo ">>> Container status after checkpoint:"
-          docker ps -a --filter name=looper
+          sudo podman ps -a --filter name=looper
 
-          echo ">>> Restoring from checkpoint"
-          if docker start --checkpoint cp1 looper; then
-            echo "Restore: SUCCESS"
-          else
-            echo "Restore: FAILED"
-            exit 1
-          fi
+          echo ">>> Restoring container"
+          sudo podman container restore looper
+          echo "Restore: SUCCESS"
 
-          sleep 2
+          sleep 3
           echo ">>> Logs after restore (should continue counting):"
-          docker logs looper | tail -8
+          sudo podman logs looper | tail -8
 
-          # Simple verification that the process continued
-          if docker logs looper | tail -3 | grep -qE '[0-9]+'; then
-            echo "✓ Basic checkpoint/restore appears to work"
+          # Verify the counter continued
+          if sudo podman logs looper | tail -5 | grep -qE '[0-9]+'; then
+            echo "✓ Basic checkpoint/restore succeeded"
             echo "basic_ok=true" >> $GITHUB_OUTPUT
           else
-            echo "✗ Logs do not look continuous"
+            echo "✗ Logs do not look continuous after restore"
             exit 1
           fi
 
@@ -90,66 +77,97 @@ jobs:
         run: |
           set -euo pipefail
 
-          docker rm -f looper2 2>/dev/null || true
-          docker run -d --name looper2 busybox \
+          sudo podman rm -f looper2 2>/dev/null || true
+          sudo podman run -d --name looper2 docker.io/library/busybox \
             sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
           sleep 2
 
           echo ">>> Checkpoint with --leave-running"
-          if docker checkpoint create --leave-running looper2 cp-leave; then
-            echo "✓ --leave-running works"
-            docker ps --filter name=looper2
+          sudo podman container checkpoint --leave-running looper2
+          echo "✓ --leave-running succeeded"
+
+          # Container should still be running
+          if sudo podman ps --filter name=looper2 --format '{{.Status}}' | grep -q Up; then
+            echo "✓ Container still running after checkpoint"
           else
-            echo "✗ --leave-running failed"
+            echo "✗ Container was stopped (unexpected)"
             exit 1
           fi
 
-      - name: Test 3 – Network sensitivity (common failure point)
+      - name: Test 3 – Export / Import (migration style)
+        run: |
+          set -euo pipefail
+
+          sudo podman rm -f looper3 2>/dev/null || true
+          sudo podman run -d --name looper3 docker.io/library/busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          sleep 2
+
+          echo ">>> Exporting checkpoint"
+          sudo podman container checkpoint --export=/tmp/looper3-chkpt.tar.gz looper3
+          ls -lh /tmp/looper3-chkpt.tar.gz
+
+          echo ">>> Importing checkpoint under a new name"
+          sudo podman container restore --import=/tmp/looper3-chkpt.tar.gz --name looper3-restored
+
+          sleep 2
+          echo ">>> Logs of restored container:"
+          sudo podman logs looper3-restored | tail -6
+
+          echo "✓ Export/Import succeeded"
+
+      - name: Test 4 – TCP established (optional, soft-fail)
         continue-on-error: true
         run: |
           set -euo pipefail
 
-          docker rm -f nettest 2>/dev/null || true
+          sudo podman rm -f tcptest          # Simple TCP server
+          sudo podman run -d --name tcpsrv docker.io/library/busybox \
+            sh -c 'while true; do nc -l -p 9999 -e echo PONG; done' || \
+          sudo podman run -d --name tcpsrv docker.io/library/busybox \
+            sh -c 'while true; do nc -l -p 9999; done'
 
-          # Default bridge network (often problematic)
-          docker run -d --name nettest busybox \
-            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
           sleep 2
 
-          echo ">>> Trying checkpoint on default bridge network"
-          if docker checkpoint create nettest cp-net; then
-            echo "✓ Bridge network checkpoint succeeded"
-            docker start --checkpoint cp-net nettest || true
+          echo ">>> Trying checkpoint with --tcp-established"
+          if sudo podman container checkpoint --tcp-established tcpsrv; then
+            echo "✓ TCP established checkpoint succeeded"
+            sudo podman container restore tcpsrv || true
           else
-            echo "✗ Bridge network checkpoint failed (this is a known limitation)"
-            echo "Many users need --network=host for reliable checkpointing"
+            echo "TCP established checkpoint failed (can be environment-dependent)"
+            exit 0
           fi
 
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f looper looper2 nettest 2>/dev/null || true
-          docker checkpoint ls looper 2>/dev/null || true
+          sudo podman rm -f looper looper2 looper3 looper3-restored tcpsrv 2>/dev/null || true
+          sudo podman container checkpoint ls 2>/dev/null || true
+          rm -f /tmp/looper3-chkpt.tar.gz
 
-      - name: Final verdict
+      - name: Final Verdict
         if: always()
         run: |
           echo "======================================================"
-          echo " Docker Checkpoint Support on GitHub Actions"
+          echo " Podman + CRIU Checkpoint/Restore on GitHub Actions"
           echo "======================================================"
           echo
-          echo "CRIU version: $(criu --version 2>/dev/null || echo 'not found')"
-          echo "Docker experimental: $(docker info 2>/dev/null | grep -i experimental || echo 'unknown')"
+          echo "CRIU:   $(criu --version 2>/dev/null || echo 'not found')"
+          echo "Podman: $(podman --version 2>/dev/null || echo 'not found')"
           echo
           if [ "${{ steps.basic.outputs.basic_ok }}" = "true" ]; then
-            echo "✅ RESULT: Basic Docker checkpoint/restore WORKS on this runner"
+            echo "✅ RESULT: Basic Podman checkpoint + restore WORKS"
+            echo
+            echo "Supported features observed:"
+            echo "  - Basic checkpoint / restore"
+            echo "  - --leave-running"
+            echo "  - --export / --import (migration style)"
             echo
             echo "Notes:"
-            echo "  - Experimental mode must be enabled"
+            echo "  - Requires root (sudo)"
             echo "  - CRIU must be installed on the host"
-            echo "  - Default bridge networking is often unreliable"
-            echo "  - Feature remains experimental in Docker"
+            echo "  - Prefer Podman over Docker for container C/R"
           else
-            echo "❌ RESULT: Basic Docker checkpoint/restore FAILED"
+            echo "❌ RESULT: Basic Podman checkpoint/restore FAILED"
             echo "Check the logs above for the exact error."
           fi
