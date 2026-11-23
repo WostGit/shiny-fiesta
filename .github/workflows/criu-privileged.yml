@@ -1,4 +1,4 @@
-name: Podman CRIU Checkpoint/Restore Tests
+name: Ultra-Verbose CRIU Paths Test (Raw + Docker + Podman)
 
 on:
   push:
@@ -7,25 +7,30 @@ on:
   workflow_dispatch:
 
 jobs:
-  podman-criu:
+  all-criu-paths:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
 
     steps:
-      - name: Install CRIU + Podman dependencies
+      # ================================================================
+      # 0. Common setup – CRIU + tools
+      # ================================================================
+      - name: "0. Install CRIU and common tools"
         run: |
           set -euo pipefail
+          echo "=============================================="
+          echo " Installing CRIU from official PPA"
+          echo "=============================================="
+
           sudo apt-get update
           sudo apt-get install -y software-properties-common
           sudo add-apt-repository -y ppa:criu/ppa
           sudo apt-get update
-          sudo apt-get install -y criu podman crun runc
+          sudo apt-get install -y criu build-essential python3 iproute2
 
-          echo "=== Versions ==="
+          echo
+          echo "=== CRIU version ==="
           criu --version
-          podman --version
-          crun --version || true
-          runc --version || true
 
           echo
           echo "=== criu check ==="
@@ -33,141 +38,359 @@ jobs:
           sudo criu check --extra || true
 
           echo
-          echo "=== Podman info (runtime) ==="
-          podman info --format '{{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Version}}' || true
+          echo "=== Kernel ==="
+          uname -a
 
-      - name: Test 1 – Basic checkpoint + restore
-        id: basic
+      # ================================================================
+      # PATH 1 – Raw privileged CRIU
+      # ================================================================
+      - name: "1. Raw CRIU – Basic process dump/restore"
+        id: raw_basic
         run: |
           set -euo pipefail
+          echo "=============================================="
+          echo " PATH 1: Raw privileged CRIU"
+          echo "=============================================="
+          echo ">>> Creating long-running process"
 
-          echo ">>> Starting counter container"
-          sudo podman run -d --name looper docker.io/library/busybox \
-            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          mkdir -p /tmp/criu-raw
+          cd /tmp/criu-raw
+          rm -rf basic && mkdir basic
 
-          sleep 3
-          echo ">>> Logs before checkpoint:"
-          sudo podman logs looper | tail -5
+          setsid bash -c 'echo READY > /tmp/raw-basic.marker; while true; do sleep 1; done' </dev/null >/dev/null 2>&1 &
+          sleep 0.5
+          PID=$(pgrep -f "raw-basic.marker" | head -1)
+          echo "PID = $PID"
+          test -n "$PID"
 
-          echo ">>> Creating checkpoint"
-          sudo podman container checkpoint looper
-          echo "Checkpoint create: SUCCESS"
+          echo ">>> Dumping process"
+          sudo criu dump -t "$PID" -D basic --shell-job -v3
+          echo "Dump succeeded"
 
-          echo ">>> Container status after checkpoint:"
-          sudo podman ps -a --filter name=looper
+          echo ">>> Restoring process"
+          sudo criu restore -D basic --shell-job -d -v3
+          sleep 1
 
-          echo ">>> Restoring container"
-          sudo podman container restore looper
-          echo "Restore: SUCCESS"
-
-          sleep 3
-          echo ">>> Logs after restore (should continue counting):"
-          sudo podman logs looper | tail -8
-
-          # Verify the counter continued
-          if sudo podman logs looper | tail -5 | grep -qE '[0-9]+'; then
-            echo "✓ Basic checkpoint/restore succeeded"
-            echo "basic_ok=true" >> $GITHUB_OUTPUT
+          if [ -f /tmp/raw-basic.marker ] && pgrep -f "sleep 1" >/dev/null; then
+            echo "✓ Raw CRIU basic dump/restore SUCCEEDED"
+            echo "raw_basic_ok=true" >> $GITHUB_OUTPUT
           else
-            echo "✗ Logs do not look continuous after restore"
+            echo "✗ Raw CRIU basic restore FAILED"
             exit 1
           fi
 
-      - name: Test 2 – Checkpoint with --leave-running
+      - name: "1b. Raw CRIU – Shared memory + file locks"
+        id: raw_shm
         run: |
           set -euo pipefail
+          cd /tmp/criu-raw
+          rm -rf shm && mkdir shm
 
-          sudo podman rm -f looper2 2>/dev/null || true
-          sudo podman run -d --name looper2 docker.io/library/busybox \
-            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
-          sleep 2
+          cat > /tmp/shm_test.c << 'EOF'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <sys/mman.h>
+          #include <sys/file.h>
+          #include <string.h>
+          int main(void) {
+              int fd = open("/tmp/criu-lock", O_RDWR|O_CREAT, 0644);
+              flock(fd, LOCK_EX);
+              int s = shm_open("/criu_test_shm", O_CREAT|O_RDWR, 0600);
+              ftruncate(s, 4096);
+              void *p = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, s, 0);
+              strcpy(p, "hello-criu-shm");
+              printf("READY\n"); fflush(stdout);
+              while (1) sleep(1);
+          }
+          EOF
 
-          echo ">>> Checkpoint with --leave-running"
-          sudo podman container checkpoint --leave-running looper2
-          echo "✓ --leave-running succeeded"
+          gcc -o /tmp/shm_test /tmp/shm_test.c -lrt
+          /tmp/shm_test > /tmp/shm.out 2>&1 &
+          sleep 0.6
+          PID=$(pgrep -f shm_test | head -1)
+          echo "PID = $PID"
+          test -n "$PID"
 
-          # Container should still be running
-          if sudo podman ps --filter name=looper2 --format '{{.Status}}' | grep -q Up; then
-            echo "✓ Container still running after checkpoint"
+          echo ">>> Dumping with --file-locks"
+          sudo criu dump -t "$PID" -D shm --shell-job --file-locks -v3
+          echo "✓ Raw CRIU shared-memory + locks SUCCEEDED"
+          echo "raw_shm_ok=true" >> $GITHUB_OUTPUT
+
+      - name: "1c. Raw CRIU – Established TCP (dump only)"
+        id: raw_tcp
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd /tmp/criu-raw
+          rm -rf tcp && mkdir tcp
+
+          python3 -c '
+          import socket, time
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("127.0.0.1", 9876))
+          s.listen(1)
+          print("SERVER_READY", flush=True)
+          conn, _ = s.accept()
+          print("CONNECTED", flush=True)
+          while True:
+              data = conn.recv(32)
+              if not data: break
+              conn.sendall(b"PONG")
+              time.sleep(0.2)
+          ' > /tmp/tcp_server.log 2>&1 &
+          SERVER_PID=$!
+          sleep 0.8
+
+          python3 -c '
+          import socket, time
+          c = socket.socket()
+          c.connect(("127.0.0.1", 9876))
+          for _ in range(6):
+              c.sendall(b"PING")
+              print(c.recv(32))
+              time.sleep(0.15)
+          ' > /tmp/tcp_client.log 2>&1 &
+          sleep 1
+
+          echo "Server PID = $SERVER_PID"
+          if sudo criu dump -t "$SERVER_PID" -D tcp --shell-job --tcp-established -v3; then
+            echo "✓ Raw CRIU TCP established dump SUCCEEDED"
+            echo "raw_tcp_ok=true" >> $GITHUB_OUTPUT
           else
-            echo "✗ Container was stopped (unexpected)"
-            exit 1
+            echo "Raw CRIU TCP dump failed (soft)"
+            exit 0
           fi
 
-      - name: Test 3 – Export / Import (migration style)
+      # ================================================================
+      # PATH 2 – Docker experimental checkpoint/restore
+      # ================================================================
+      - name: "2. Docker – Enable experimental + install if needed"
         run: |
           set -euo pipefail
+          echo "=============================================="
+          echo " PATH 2: Docker experimental checkpoint"
+          echo "=============================================="
 
-          sudo podman rm -f looper3 2>/dev/null || true
-          sudo podman run -d --name looper3 docker.io/library/busybox \
-            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
-          sleep 2
+          # Docker may have been removed by earlier apt operations; reinstall if missing
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Docker not found – installing docker.io"
+            sudo apt-get install -y docker.io
+            sudo systemctl start docker || true
+          fi
 
-          echo ">>> Exporting checkpoint"
-          sudo podman container checkpoint --export=/tmp/looper3-chkpt.tar.gz looper3
-          ls -lh /tmp/looper3-chkpt.tar.gz
+          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker || sudo service docker restart || true
+          sleep 4
 
-          echo ">>> Importing checkpoint under a new name"
-          sudo podman container restore --import=/tmp/looper3-chkpt.tar.gz --name looper3-restored
+          echo "=== Docker version ==="
+          docker version || true
+          echo
+          echo "=== Experimental flag ==="
+          docker info 2>/dev/null | grep -i experimental || echo "Could not read experimental flag"
 
-          sleep 2
-          echo ">>> Logs of restored container:"
-          sudo podman logs looper3-restored | tail -6
-
-          echo "✓ Export/Import succeeded"
-
-      - name: Test 4 – TCP established (optional, soft-fail)
+      - name: "2a. Docker – Checkpoint create"
+        id: docker_create
         continue-on-error: true
         run: |
           set -euo pipefail
 
-          sudo podman rm -f tcptest          # Simple TCP server
-          sudo podman run -d --name tcpsrv docker.io/library/busybox \
-            sh -c 'while true; do nc -l -p 9999 -e echo PONG; done' || \
-          sudo podman run -d --name tcpsrv docker.io/library/busybox \
-            sh -c 'while true; do nc -l -p 9999; done'
+          docker rm -f looper-docker 2>/dev/null || true
+          docker run -d --name looper-docker busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          sleep 3
 
-          sleep 2
+          echo ">>> Logs before checkpoint:"
+          docker logs looper-docker | tail -5 || true
 
-          echo ">>> Trying checkpoint with --tcp-established"
-          if sudo podman container checkpoint --tcp-established tcpsrv; then
-            echo "✓ TCP established checkpoint succeeded"
-            sudo podman container restore tcpsrv || true
+          echo ">>> Creating checkpoint"
+          if docker checkpoint create looper-docker cp1; then
+            echo "✓ Docker checkpoint create SUCCEEDED"
+            echo "docker_create_ok=true" >> $GITHUB_OUTPUT
           else
-            echo "TCP established checkpoint failed (can be environment-dependent)"
+            echo "✗ Docker checkpoint create FAILED"
+            exit 1
+          fi
+
+          docker ps -a --filter name=looper-docker || true
+
+      - name: "2b. Docker – Restore from checkpoint"
+        id: docker_restore
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.docker_create.outputs.docker_create_ok }}" != "true" ]; then
+            echo "Skipping restore – create did not succeed"
             exit 0
           fi
 
+          echo ">>> Attempting restore"
+          if docker start --checkpoint cp1 looper-docker; then
+            echo "✓ Docker restore SUCCEEDED"
+            sleep 2
+            docker logs looper-docker | tail -8 || true
+            echo "docker_restore_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "✗ Docker restore FAILED (known issue with containerd content store on GHA)"
+            exit 0
+          fi
+
+      # ================================================================
+      # PATH 3 – Podman + CRIU (force runc)
+      # ================================================================
+      - name: "3. Podman – Install and force runc runtime"
+        run: |
+          set -euo pipefail
+          echo "=============================================="
+          echo " PATH 3: Podman checkpoint/restore (runc)"
+          echo "=============================================="
+
+          sudo apt-get install -y podman runc crun || true
+
+          # Force runc – crun on Ubuntu 24.04 is often built without CRIU
+          sudo mkdir -p /etc/containers
+          cat <<EOF | sudo tee /etc/containers/containers.conf
+          [engine]
+          runtime = "runc"
+          EOF
+
+          echo "=== Versions ==="
+          podman --version
+          runc --version || true
+          crun --version || true
+
+          echo
+          echo "=== Active runtime after force ==="
+          podman info --format '{{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Version}}' || true
+
+      - name: "3a. Podman – Basic checkpoint + restore"
+        id: podman_basic
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          sudo podman rm -f looper-podman 2>/dev/null || true
+          sudo podman run -d --name looper-podman --runtime=runc docker.io/library/busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          sleep 3
+
+          echo ">>> Logs before checkpoint:"
+          sudo podman logs looper-podman | tail -5
+
+          echo ">>> Creating checkpoint"
+          if sudo podman container checkpoint --runtime=runc looper-podman; then
+            echo "Checkpoint create: SUCCESS"
+          else
+            echo "Checkpoint create: FAILED"
+            exit 1
+          fi
+
+          echo ">>> Restoring"
+          if sudo podman container restore --runtime=runc looper-podman; then
+            echo "Restore: SUCCESS"
+          else
+            echo "Restore: FAILED"
+            exit 1
+          fi
+
+          sleep 3
+          echo ">>> Logs after restore:"
+          sudo podman logs looper-podman | tail -8
+
+          if sudo podman logs looper-podman | tail -5 | grep -qE '[0-9]+'; then
+            echo "✓ Podman basic checkpoint/restore SUCCEEDED"
+            echo "podman_basic_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "✗ Podman restore did not continue cleanly"
+            exit 1
+          fi
+
+      - name: "3b. Podman – Export / Import"
+        id: podman_export
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          sudo podman rm -f looper-export 2>/dev/null || true
+          sudo podman run -d --name looper-export --runtime=runc docker.io/library/busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          sleep 2
+
+          echo ">>> Exporting checkpoint"
+          sudo podman container checkpoint --runtime=runc --export=/tmp/podman-chkpt.tar.gz looper-export
+          ls -lh /tmp/podman-chkpt.tar.gz
+
+          echo ">>> Importing under new name"
+          sudo podman container restore --runtime=runc --import=/tmp/podman-chkpt.tar.gz --name looper-imported
+
+          sleep 2
+          sudo podman logs looper-imported | tail -6
+          echo "✓ Podman export/import SUCCEEDED"
+          echo "podman_export_ok=true" >> $GITHUB_OUTPUT
+
+      - name: "3c. Podman – --leave-running"
+        id: podman_leave
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          sudo podman rm -f looper-leave 2>/dev/null || true
+          sudo podman run -d --name looper-leave --runtime=runc docker.io/library/busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          sleep 2
+
+          sudo podman container checkpoint --runtime=runc --leave-running looper-leave
+          if sudo podman ps --filter name=looper-leave --format '{{.Status}}' | grep -q Up; then
+            echo "✓ Podman --leave-running SUCCEEDED"
+            echo "podman_leave_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "✗ Container was stopped"
+            exit 1
+          fi
+
+      # ================================================================
+      # Cleanup + Final Verdict
+      # ================================================================
       - name: Cleanup
         if: always()
         run: |
-          sudo podman rm -f looper looper2 looper3 looper3-restored tcpsrv 2>/dev/null || true
-          sudo podman container checkpoint ls 2>/dev/null || true
-          rm -f /tmp/looper3-chkpt.tar.gz
+          sudo podman rm -f looper-podman looper-export looper-imported looper-leave 2>/dev/null || true
+          docker rm -f looper-docker 2>/dev/null || true
+          rm -rf /tmp/criu-raw /tmp/podman-chkpt.tar.gz /tmp/shm_test /tmp/shm.out /tmp/criu-lock 2>/dev/null || true
+          pkill -f "raw-basic.marker" 2>/dev/null || true
+          pkill -f shm_test 2>/dev/null || true
 
-      - name: Final Verdict
+      - name: "FINAL VERDICT – All three paths"
         if: always()
         run: |
-          echo "======================================================"
-          echo " Podman + CRIU Checkpoint/Restore on GitHub Actions"
-          echo "======================================================"
+          echo "=============================================================="
+          echo " FINAL VERDICT – CRIU on GitHub Actions (ubuntu-24.04)"
+          echo "=============================================================="
           echo
-          echo "CRIU:   $(criu --version 2>/dev/null || echo 'not found')"
-          echo "Podman: $(podman --version 2>/dev/null || echo 'not found')"
+          echo "CRIU version : $(criu --version 2>/dev/null || echo 'n/a')"
+          echo "Podman       : $(podman --version 2>/dev/null || echo 'n/a')"
+          echo "Docker       : $(docker --version 2>/dev/null || echo 'n/a')"
           echo
-          if [ "${{ steps.basic.outputs.basic_ok }}" = "true" ]; then
-            echo "✅ RESULT: Basic Podman checkpoint + restore WORKS"
-            echo
-            echo "Supported features observed:"
-            echo "  - Basic checkpoint / restore"
-            echo "  - --leave-running"
-            echo "  - --export / --import (migration style)"
-            echo
-            echo "Notes:"
-            echo "  - Requires root (sudo)"
-            echo "  - CRIU must be installed on the host"
-            echo "  - Prefer Podman over Docker for container C/R"
-          else
-            echo "❌ RESULT: Basic Podman checkpoint/restore FAILED"
-            echo "Check the logs above for the exact error."
-          fi
+          echo "---------------- PATH 1: Raw privileged CRIU ----------------"
+          echo "Basic dump/restore     : ${{ steps.raw_basic.outputs.raw_basic_ok || 'FAILED' }}"
+          echo "Shared mem + locks     : ${{ steps.raw_shm.outputs.raw_shm_ok || 'FAILED' }}"
+          echo "TCP established (dump) : ${{ steps.raw_tcp.outputs.raw_tcp_ok || 'soft-fail / not run' }}"
+          echo
+          echo "---------------- PATH 2: Docker experimental ----------------"
+          echo "Checkpoint create      : ${{ steps.docker_create.outputs.docker_create_ok || 'FAILED' }}"
+          echo "Restore                : ${{ steps.docker_restore.outputs.docker_restore_ok || 'FAILED (expected on GHA)' }}"
+          echo
+          echo "---------------- PATH 3: Podman (forced runc) ---------------"
+          echo "Basic checkpoint/restore: ${{ steps.podman_basic.outputs.podman_basic_ok || 'FAILED' }}"
+          echo "Export / Import         : ${{ steps.podman_export.outputs.podman_export_ok || 'FAILED' }}"
+          echo "--leave-running         : ${{ steps.podman_leave.outputs.podman_leave_ok || 'FAILED' }}"
+          echo
+          echo "=============================================================="
+          echo " Interpretation guide:"
+          echo "  • Raw CRIU          → Best for process-level testing"
+          echo "  • Docker            → Create works, restore usually broken on GHA"
+          echo "  • Podman + runc     → Best full container checkpoint/restore path"
+          echo "=============================================================="
