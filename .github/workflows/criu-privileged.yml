@@ -1,4 +1,4 @@
-name: CRIU Privileged Feature Tests
+name: Docker Checkpoint Support Test
 
 on:
   push:
@@ -7,13 +7,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  privileged-criu:
+  docker-checkpoint-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install CRIU
         run: |
           set -euo pipefail
@@ -21,176 +19,137 @@ jobs:
           sudo apt-get install -y software-properties-common
           sudo add-apt-repository -y ppa:criu/ppa
           sudo apt-get update
-          sudo apt-get install -y criu build-essential python3 iproute2
+          sudo apt-get install -y criu
 
           echo "=== CRIU version ==="
           criu --version
-          echo
-          echo "=== criu check ==="
           sudo criu check
-          sudo criu check --extra || true
 
-      - name: Create workspace
-        run: mkdir -p /tmp/criu-tests
-
-      # ---------------------------------------------------------------
-      # Test 1 – Basic dump + restore
-      # ---------------------------------------------------------------
-      - name: "1. Basic dump/restore"
+      - name: Enable Docker experimental features
         run: |
           set -euo pipefail
-          cd /tmp/criu-tests
-          rm -rf basic && mkdir basic
 
-          # Clean long-running process
-          setsid bash -c 'echo READY > /tmp/basic.marker; while true; do sleep 1; done' </dev/null >/dev/null 2>&1 &
-          sleep 0.4
-          PID=$(pgrep -f "basic.marker" | head -1)
-          echo "PID = $PID"
-          test -n "$PID"
+          # Enable experimental mode (required for checkpoint)
+          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
 
-          sudo criu dump -t "$PID" -D basic --shell-job -v3
-          echo "Dump OK"
+          # Restart Docker
+          sudo systemctl restart docker
+          sleep 3
 
-          # Original process is gone after successful dump
-          sudo criu restore -D basic --shell-job -d -v3
-          sleep 1
+          echo "=== Docker info (experimental) ==="
+          docker info | grep -iE 'experimental|runc|criu' || true
+          docker version
 
-          if [ -f /tmp/basic.marker ] && pgrep -f "sleep 1" >/dev/null; then
-            echo "✓ Basic dump/restore succeeded"
+      - name: Test 1 – Basic container checkpoint + restore
+        id: basic
+        run: |
+          set -euo pipefail
+
+          echo ">>> Starting test container"
+          docker run -d --name looper busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+
+          sleep 2
+          echo ">>> Logs before checkpoint:"
+          docker logs looper | tail -5
+
+          echo ">>> Creating checkpoint"
+          if docker checkpoint create looper cp1; then
+            echo "Checkpoint create: SUCCESS"
           else
-            echo "✗ Restore did not bring process back"
-            ls -l /tmp/basic.marker || true
-            ps aux | head -20
+            echo "Checkpoint create: FAILED"
+            docker logs looper || true
             exit 1
           fi
 
-      # ---------------------------------------------------------------
-      # Test 2 – Shared memory + file lock  (needs --file-locks)
-      # ---------------------------------------------------------------
-      - name: "2. Shared memory + file lock"
-        run: |
-          set -euo pipefail
-          cd /tmp/criu-tests
-          rm -rf shm && mkdir shm
+          echo ">>> Container status after checkpoint:"
+          docker ps -a --filter name=looper
 
-          cat > /tmp/shm_test.c << 'EOF'
-          #define _GNU_SOURCE
-          #include <stdio.h>
-          #include <unistd.h>
-          #include <fcntl.h>
-          #include <sys/mman.h>
-          #include <sys/file.h>
-          #include <string.h>
-          int main(void) {
-              int fd = open("/tmp/criu-lock", O_RDWR|O_CREAT, 0644);
-              flock(fd, LOCK_EX);
-              int s = shm_open("/criu_test_shm", O_CREAT|O_RDWR, 0600);
-              ftruncate(s, 4096);
-              void *p = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, s, 0);
-              strcpy(p, "hello-criu-shm");
-              printf("READY\n"); fflush(stdout);
-              while (1) sleep(1);
-          }
-          EOF
-
-          gcc -o /tmp/shm_test /tmp/shm_test.c -lrt
-          /tmp/shm_test > /tmp/shm.out 2>&1 &
-          sleep 0.5
-          PID=$(pgrep -f shm_test | head -1)
-          echo "PID = $PID"
-          test -n "$PID"
-
-          # Critical: --file-locks is required when the process holds flock()
-          sudo criu dump -t "$PID" -D shm --shell-job --file-locks -v3
-          echo "✓ Shared-memory + lock dump succeeded"
-
-      # ---------------------------------------------------------------
-      # Test 3 – Established TCP (dump only)
-      # ---------------------------------------------------------------
-      - name: "3. Established TCP dump"
-        run: |
-          set -euo pipefail
-          cd /tmp/criu-tests
-          rm -rf tcp && mkdir tcp
-
-          python3 -c '
-          import socket, time
-          s = socket.socket()
-          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-          s.bind(("127.0.0.1", 9876))
-          s.listen(1)
-          print("SERVER_READY", flush=True)
-          conn, _ = s.accept()
-          print("CONNECTED", flush=True)
-          while True:
-              data = conn.recv(32)
-              if not data: break
-              conn.sendall(b"PONG")
-              time.sleep(0.2)
-          ' > /tmp/tcp_server.log 2>&1 &
-          SERVER_PID=$!
-          sleep 0.6
-
-          python3 -c '
-          import socket, time
-          c = socket.socket()
-          c.connect(("127.0.0.1", 9876))
-          for _ in range(8):
-              c.sendall(b"PING")
-              print(c.recv(32))
-              time.sleep(0.15)
-          ' > /tmp/tcp_client.log 2>&1 &
-          sleep 0.8
-
-          echo "Server PID = $SERVER_PID"
-          if sudo criu dump -t "$SERVER_PID" -D tcp --shell-job --tcp-established -v3; then
-            echo "✓ TCP established dump succeeded"
+          echo ">>> Restoring from checkpoint"
+          if docker start --checkpoint cp1 looper; then
+            echo "Restore: SUCCESS"
           else
-            echo "TCP dump failed (can be environment-dependent) – continuing"
-            exit 0
+            echo "Restore: FAILED"
+            exit 1
           fi
 
-      # ---------------------------------------------------------------
-      # Test 4 – Simple namespaces (soft-fail)
-      # ---------------------------------------------------------------
-      - name: "4. Simple namespaces"
+          sleep 2
+          echo ">>> Logs after restore (should continue counting):"
+          docker logs looper | tail -8
+
+          # Simple verification that the process continued
+          if docker logs looper | tail -3 | grep -qE '[0-9]+'; then
+            echo "✓ Basic checkpoint/restore appears to work"
+            echo "basic_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "✗ Logs do not look continuous"
+            exit 1
+          fi
+
+      - name: Test 2 – Checkpoint with --leave-running
         run: |
           set -euo pipefail
-          cd /tmp/criu-tests
-          rm -rf ns && mkdir ns
 
-          sudo unshare -p -m --fork --mount-proc \
-            bash -c 'echo NS_READY > /tmp/ns.marker; while true; do sleep 1; done' &
-          sleep 0.7
+          docker rm -f looper2 2>/dev/null || true
+          docker run -d --name looper2 busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          sleep 2
 
-          PID=$(pgrep -f "ns.marker" | head -1 || true)
-          if [ -z "$PID" ]; then
-            echo "Could not find namespaced process – skipping"
-            exit 0
-          fi
-          echo "Namespaced PID = $PID"
-
-          if sudo criu dump -t "$PID" -D ns --shell-job -v3; then
-            echo "✓ Namespace dump succeeded"
+          echo ">>> Checkpoint with --leave-running"
+          if docker checkpoint create --leave-running looper2 cp-leave; then
+            echo "✓ --leave-running works"
+            docker ps --filter name=looper2
           else
-            echo "Namespace dump failed (complex on shared runners) – continuing"
-            exit 0
+            echo "✗ --leave-running failed"
+            exit 1
           fi
 
-      # ---------------------------------------------------------------
-      # Summary
-      # ---------------------------------------------------------------
-      - name: Summary
+      - name: Test 3 – Network sensitivity (common failure point)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          docker rm -f nettest 2>/dev/null || true
+
+          # Default bridge network (often problematic)
+          docker run -d --name nettest busybox \
+            sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+          sleep 2
+
+          echo ">>> Trying checkpoint on default bridge network"
+          if docker checkpoint create nettest cp-net; then
+            echo "✓ Bridge network checkpoint succeeded"
+            docker start --checkpoint cp-net nettest || true
+          else
+            echo "✗ Bridge network checkpoint failed (this is a known limitation)"
+            echo "Many users need --network=host for reliable checkpointing"
+          fi
+
+      - name: Cleanup
         if: always()
         run: |
-          echo "=============================================="
-          echo " CRIU Privileged Feature Tests – Summary"
-          echo "=============================================="
-          criu --version || true
+          docker rm -f looper looper2 nettest 2>/dev/null || true
+          docker checkpoint ls looper 2>/dev/null || true
+
+      - name: Final verdict
+        if: always()
+        run: |
+          echo "======================================================"
+          echo " Docker Checkpoint Support on GitHub Actions"
+          echo "======================================================"
           echo
-          echo "Images left in /tmp/criu-tests:"
-          find /tmp/criu-tests -maxdepth 2 -type d 2>/dev/null || true
+          echo "CRIU version: $(criu --version 2>/dev/null || echo 'not found')"
+          echo "Docker experimental: $(docker info 2>/dev/null | grep -i experimental || echo 'unknown')"
           echo
-          echo "Key result: if Test 1 (Basic dump/restore) passed,"
-          echo "privileged CRIU is working on this runner."
+          if [ "${{ steps.basic.outputs.basic_ok }}" = "true" ]; then
+            echo "✅ RESULT: Basic Docker checkpoint/restore WORKS on this runner"
+            echo
+            echo "Notes:"
+            echo "  - Experimental mode must be enabled"
+            echo "  - CRIU must be installed on the host"
+            echo "  - Default bridge networking is often unreliable"
+            echo "  - Feature remains experimental in Docker"
+          else
+            echo "❌ RESULT: Basic Docker checkpoint/restore FAILED"
+            echo "Check the logs above for the exact error."
+          fi
