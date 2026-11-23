@@ -1,27 +1,25 @@
-name: Full CRIU Fix Attempt + Extensive Tests
+name: CRIU Exhaustive Fallbacks Test
 
 on:
   push:
-    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
 jobs:
-  full-criu-fix-test:
+  exhaustive-fallbacks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     steps:
-      # ================================================================
+      # ----------------------------------------------------------------
       # 0. Common setup
-      # ================================================================
+      # ----------------------------------------------------------------
       - name: "0. Install CRIU + tools"
         run: |
           set -euo pipefail
           echo "=============================================="
           echo " Installing CRIU + dependencies"
           echo "=============================================="
-
           sudo apt-get update
           sudo apt-get install -y software-properties-common
           sudo add-apt-repository -y ppa:criu/ppa
@@ -41,17 +39,13 @@ jobs:
           echo "=== Kernel ==="
           uname -a
 
-      # ================================================================
-      # PATH 1 – Raw privileged CRIU (already solid)
-      # ================================================================
-      - name: "1a. Raw CRIU – Basic process + continuity"
+      # ----------------------------------------------------------------
+      # PATH 1 – Raw privileged CRIU (control)
+      # ----------------------------------------------------------------
+      - name: "1a. Raw CRIU – Basic + continuity"
         id: raw_basic
         run: |
           set -euo pipefail
-          echo "=============================================="
-          echo " PATH 1a: Raw CRIU – Basic"
-          echo "=============================================="
-
           mkdir -p /tmp/criu-raw/basic
           cd /tmp/criu-raw
 
@@ -61,31 +55,27 @@ jobs:
             while true; do
               echo $i >> /tmp/raw-basic.count
               i=$((i+1))
-              sleep 0.4
+              sleep 0.3
             done
           ' </dev/null >/dev/null 2>&1 &
 
           sleep 1.2
           PID=$(pgrep -f "raw-basic.marker" | head -1)
-          echo "PID = $PID"
+          echo "PID=$PID"
           test -n "$PID"
 
           COUNT_BEFORE=$(wc -l < /tmp/raw-basic.count || echo 0)
-          echo "Count before: $COUNT_BEFORE"
-
           sudo criu dump -t "$PID" -D basic --shell-job -v3
-          echo "Dump OK"
-
           sudo criu restore -D basic --shell-job -d -v3
           sleep 1.5
 
           if [ -f /tmp/raw-basic.marker ] && pgrep -f "raw-basic.marker" >/dev/null; then
             COUNT_AFTER=$(wc -l < /tmp/raw-basic.count || echo 0)
-            echo "Count after: $COUNT_AFTER"
-            echo "✓ Raw CRIU basic SUCCEEDED"
+            echo "Count before=$COUNT_BEFORE after=$COUNT_AFTER"
+            echo "✓ Raw basic SUCCEEDED"
             echo "raw_basic_ok=true" >> $GITHUB_OUTPUT
           else
-            echo "✗ Raw basic failed"
+            echo "✗ Raw basic FAILED"
             exit 1
           fi
 
@@ -104,7 +94,6 @@ jobs:
           #include <sys/mman.h>
           #include <sys/file.h>
           #include <string.h>
-          #include <stdlib.h>
           int main(void) {
               int fd = open("/tmp/criu-lock", O_RDWR|O_CREAT, 0644);
               flock(fd, LOCK_EX);
@@ -125,7 +114,7 @@ jobs:
           test -n "$PID"
 
           sudo criu dump -t "$PID" -D shm --shell-job --file-locks -v3
-          echo "✓ Raw CRIU shm+locks SUCCEEDED"
+          echo "✓ Raw shm+locks SUCCEEDED"
           echo "raw_shm_ok=true" >> $GITHUB_OUTPUT
 
       - name: "1c. Raw CRIU – TCP established"
@@ -158,7 +147,7 @@ jobs:
           import socket, time
           c = socket.socket()
           c.connect(("127.0.0.1", 9876))
-          for i in range(15):
+          for i in range(12):
               c.sendall(f"PING{i}".encode())
               print(c.recv(64), flush=True)
               time.sleep(0.15)
@@ -166,47 +155,46 @@ jobs:
           sleep 1.5
 
           if sudo criu dump -t "$SERVER_PID" -D tcp --shell-job --tcp-established -v3; then
-            echo "✓ Raw CRIU TCP SUCCEEDED"
+            echo "✓ Raw TCP SUCCEEDED"
             echo "raw_tcp_ok=true" >> $GITHUB_OUTPUT
           else
             echo "Raw TCP soft-fail"
             exit 0
           fi
 
-      # ================================================================
-      # PATH 2 – Docker – Aggressive workarounds for restore
-      # ================================================================
-      - name: "2. Docker – Prepare + experimental"
+      # ----------------------------------------------------------------
+      # PATH 2 – Docker – Exhaustive fallback matrix
+      # ----------------------------------------------------------------
+      - name: "2. Docker – Prepare experimental"
         run: |
           set -euo pipefail
           echo "=============================================="
-          echo " PATH 2: Docker – Aggressive restore attempts"
+          echo " PATH 2: Docker exhaustive fallbacks"
           echo "=============================================="
 
           if ! command -v docker >/dev/null 2>&1; then
             sudo apt-get install -y docker.io
           fi
 
-          # Enable experimental
           echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker || sudo service docker restart || true
-          sleep 5
+          sleep 6
 
           docker version
-          docker info 2>/dev/null | grep -i experimental || true
+          docker info 2>/dev/null | grep -E 'Experimental|Server Version|containerd' || true
 
-      - name: "2a. Docker – Checkpoint create (baseline)"
+      - name: "2a. Docker – Baseline create"
         id: docker_create
         continue-on-error: true
         run: |
           set -euo pipefail
-
-          docker rm -f looper-d1 2>/dev/null || true
-          docker run -d --name looper-d1 busybox \
-            sh -c 'i=0; while true; do echo "d-$i"; i=$((i+1)); sleep 1; done'
+          docker rm -f looper-d0 2>/dev/null || true
+          docker run -d --name looper-d0 \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            busybox sh -c 'i=0; while true; do echo "d0-$i"; i=$((i+1)); sleep 1; done'
           sleep 4
-
-          if docker checkpoint create looper-d1 cp1; then
+          if docker checkpoint create looper-d0 cp0; then
             echo "✓ Docker create SUCCEEDED"
             echo "docker_create_ok=true" >> $GITHUB_OUTPUT
           else
@@ -214,157 +202,214 @@ jobs:
             exit 1
           fi
 
-      - name: "2b. Docker – Restore attempt #1 (normal)"
-        id: docker_restore1
+      - name: "2b. Docker – Fallback 1: normal restore"
+        id: docker_f1
         continue-on-error: true
         run: |
           set -euo pipefail
-          if [ "${{ steps.docker_create.outputs.docker_create_ok }}" != "true" ]; then
-            exit 0
-          fi
-
-          echo ">>> Attempt 1: normal restore"
-          if docker start --checkpoint cp1 looper-d1; then
-            echo "✓ Docker restore #1 SUCCEEDED"
-            echo "docker_restore1_ok=true" >> $GITHUB_OUTPUT
+          echo ">>> Fallback 1: normal restore"
+          if docker start --checkpoint cp0 looper-d0; then
+            echo "✓ Fallback 1 SUCCEEDED"
+            echo "docker_f1_ok=true" >> $GITHUB_OUTPUT
             sleep 2
-            docker logs looper-d1 | tail -6 || true
+            docker logs looper-d0 | tail -5 || true
           else
-            echo "✗ Docker restore #1 FAILED"
-            docker logs looper-d1 2>&1 | tail -8 || true
+            echo "✗ Fallback 1 FAILED"
+            docker logs looper-d0 2>&1 | tail -8 || true
             exit 0
           fi
 
-      - name: "2c. Docker – Restore attempt #2 (--network=host)"
-        id: docker_restore2
+      - name: "2c. Docker – Fallback 2: --network=host"
+        id: docker_f2
         continue-on-error: true
         run: |
           set -euo pipefail
-
+          echo ">>> Fallback 2: --network=host"
           docker rm -f looper-d2 2>/dev/null || true
-          # Create with host networking (known to avoid some netns bugs)
-          docker run -d --name looper-d2 --network=host busybox \
-            sh -c 'i=0; while true; do echo "host-$i"; i=$((i+1)); sleep 1; done'
+          docker run -d --name looper-d2 --network=host \
+            --security-opt seccomp=unconfined \
+            busybox sh -c 'i=0; while true; do echo "host-$i"; i=$((i+1)); sleep 1; done'
           sleep 3
-
           if docker checkpoint create looper-d2 cp-host; then
-            echo "Checkpoint with --network=host created"
             if docker start --checkpoint cp-host looper-d2; then
-              echo "✓ Docker restore #2 (--network=host) SUCCEEDED"
-              echo "docker_restore2_ok=true" >> $GITHUB_OUTPUT
+              echo "✓ Fallback 2 (--network=host) SUCCEEDED"
+              echo "docker_f2_ok=true" >> $GITHUB_OUTPUT
               sleep 2
-              docker logs looper-d2 | tail -6 || true
+              docker logs looper-d2 | tail -5 || true
             else
-              echo "✗ Docker restore #2 still FAILED"
+              echo "✗ Fallback 2 FAILED"
               exit 0
             fi
           else
-            echo "Checkpoint create with host net failed"
+            echo "✗ Checkpoint create with host net failed"
             exit 0
           fi
 
-      - name: "2d. Docker – Restore attempt #3 (custom checkpoint-dir + manual copy)"
-        id: docker_restore3
+      - name: "2d. Docker – Fallback 3: custom checkpoint-dir + manual copy"
+        id: docker_f3
         continue-on-error: true
         run: |
           set -euo pipefail
-
+          echo ">>> Fallback 3: custom dir + manual copy"
           docker rm -f looper-d3 2>/dev/null || true
-          docker run -d --name looper-d3 busybox \
-            sh -c 'i=0; while true; do echo "dir-$i"; i=$((i+1)); sleep 1; done'
+          docker run -d --name looper-d3 \
+            --security-opt seccomp=unconfined \
+            busybox sh -c 'i=0; while true; do echo "dir-$i"; i=$((i+1)); sleep 1; done'
           sleep 3
-
-          # Use custom checkpoint directory
           mkdir -p /tmp/docker-ckpts
           if docker checkpoint create --checkpoint-dir=/tmp/docker-ckpts looper-d3 cp-dir; then
-            echo "Custom dir checkpoint created"
-
-            # Manual copy into container's checkpoint location (old workaround)
             CTR_ID=$(docker inspect -f '{{.Id}}' looper-d3)
             DEST="/var/lib/docker/containers/${CTR_ID}/checkpoints"
             sudo mkdir -p "$DEST"
             sudo cp -a /tmp/docker-ckpts/cp-dir "$DEST/" || true
-
             if docker start --checkpoint cp-dir looper-d3; then
-              echo "✓ Docker restore #3 (custom dir + copy) SUCCEEDED"
-              echo "docker_restore3_ok=true" >> $GITHUB_OUTPUT
+              echo "✓ Fallback 3 SUCCEEDED"
+              echo "docker_f3_ok=true" >> $GITHUB_OUTPUT
             else
-              echo "✗ Docker restore #3 still FAILED"
+              echo "✗ Fallback 3 FAILED"
               exit 0
             fi
           else
-            echo "Custom dir checkpoint failed"
+            echo "✗ Custom dir checkpoint failed"
             exit 0
           fi
 
-      - name: "2e. Docker – --leave-running"
+      - name: "2e. Docker – Fallback 4: leave-running then restore"
+        id: docker_f4
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo ">>> Fallback 4: --leave-running then later restore"
+          docker rm -f looper-d4 2>/dev/null || true
+          docker run -d --name looper-d4 \
+            --security-opt seccomp=unconfined \
+            busybox sh -c 'i=0; while true; do echo "leave-$i"; i=$((i+1)); sleep 1; done'
+          sleep 2
+          if docker checkpoint create --leave-running looper-d4 cp-leave; then
+            # Stop the still-running container, then try to restore from the checkpoint
+            docker stop looper-d4 || true
+            sleep 1
+            if docker start --checkpoint cp-leave looper-d4; then
+              echo "✓ Fallback 4 SUCCEEDED"
+              echo "docker_f4_ok=true" >> $GITHUB_OUTPUT
+            else
+              echo "✗ Fallback 4 FAILED"
+              exit 0
+            fi
+          else
+            echo "✗ leave-running create failed"
+            exit 0
+          fi
+
+      - name: "2f. Docker – Fallback 5: none network"
+        id: docker_f5
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo ">>> Fallback 5: --network=none"
+          docker rm -f looper-d5 2>/dev/null || true
+          docker run -d --name looper-d5 --network=none \
+            --security-opt seccomp=unconfined \
+            busybox sh -c 'i=0; while true; do echo "none-$i"; i=$((i+1)); sleep 1; done'
+          sleep 3
+          if docker checkpoint create looper-d5 cp-none; then
+            if docker start --checkpoint cp-none looper-d5; then
+              echo "✓ Fallback 5 (--network=none) SUCCEEDED"
+              echo "docker_f5_ok=true" >> $GITHUB_OUTPUT
+            else
+              echo "✗ Fallback 5 FAILED"
+              exit 0
+            fi
+          else
+            echo "✗ Checkpoint create with none net failed"
+            exit 0
+          fi
+
+      - name: "2g. Docker – Fallback 6: content-store cleanup attempt"
+        id: docker_f6
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo ">>> Fallback 6: try to clean containerd content before restore"
+          docker rm -f looper-d6 2>/dev/null || true
+          docker run -d --name looper-d6 \
+            --security-opt seccomp=unconfined \
+            busybox sh -c 'i=0; while true; do echo "clean-$i"; i=$((i+1)); sleep 1; done'
+          sleep 3
+          if docker checkpoint create looper-d6 cp-clean; then
+            # Aggressive cleanup attempt
+            sudo systemctl stop docker || true
+            sudo rm -rf /var/lib/docker/containerd/daemon/io.containerd.content.v1.content/blobs/sha256/* 2>/dev/null || true
+            sudo systemctl start docker || true
+            sleep 5
+            if docker start --checkpoint cp-clean looper-d6; then
+              echo "✓ Fallback 6 (content cleanup) SUCCEEDED"
+              echo "docker_f6_ok=true" >> $GITHUB_OUTPUT
+            else
+              echo "✗ Fallback 6 FAILED"
+              exit 0
+            fi
+          else
+            echo "✗ Checkpoint create failed"
+            exit 0
+          fi
+
+      - name: "2h. Docker – leave-running only (known good)"
         id: docker_leave
         continue-on-error: true
         run: |
           set -euo pipefail
-
-          docker rm -f looper-d4 2>/dev/null || true
-          docker run -d --name looper-d4 busybox \
+          docker rm -f looper-d7 2>/dev/null || true
+          docker run -d --name looper-d7 busybox \
             sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
           sleep 2
-
-          if docker checkpoint create --leave-running looper-d4 cp-leave; then
-            if docker ps --filter name=looper-d4 --format '{{.Status}}' | grep -q Up; then
+          if docker checkpoint create --leave-running looper-d7 cp-lr; then
+            if docker ps --filter name=looper-d7 --format '{{.Status}}' | grep -q Up; then
               echo "✓ Docker --leave-running SUCCEEDED"
               echo "docker_leave_ok=true" >> $GITHUB_OUTPUT
             else
-              echo "Container stopped despite --leave-running"
+              echo "✗ leave-running container stopped"
             fi
           else
-            echo "Docker --leave-running failed"
+            echo "✗ leave-running create failed"
             exit 0
           fi
 
-      # ================================================================
-      # PATH 3 – Podman + runc (already solid)
-      # ================================================================
+      # ----------------------------------------------------------------
+      # PATH 3 – Podman + runc (control)
+      # ----------------------------------------------------------------
       - name: "3. Podman – Force runc"
         run: |
           set -euo pipefail
           echo "=============================================="
           echo " PATH 3: Podman + runc"
           echo "=============================================="
-
           sudo apt-get install -y podman runc || true
-
           sudo mkdir -p /etc/containers
           cat <<EOF | sudo tee /etc/containers/containers.conf
           [engine]
           runtime = "runc"
           EOF
-
           podman --version
           runc --version || true
-          podman info --format '{{.Host.OCIRuntime.Name}}' || true
 
       - name: "3a. Podman – Basic C/R + continuity"
         id: podman_basic
         continue-on-error: true
         run: |
           set -euo pipefail
-
           sudo podman rm -f looper-p1 2>/dev/null || true
           sudo podman run -d --name looper-p1 --runtime=runc docker.io/library/busybox \
             sh -c 'i=0; while true; do echo "p-$i"; i=$((i+1)); sleep 1; done'
           sleep 4
-
-          LAST_BEFORE=$(sudo podman logs looper-p1 | tail -1)
-          echo "Last before: $LAST_BEFORE"
-
           sudo podman container checkpoint --runtime=runc looper-p1
           sudo podman container restore --runtime=runc looper-p1
           sleep 3
-
           if sudo podman logs looper-p1 | tail -5 | grep -qE 'p-[0-9]+'; then
-            echo "✓ Podman basic + continuity SUCCEEDED"
+            echo "✓ Podman basic SUCCEEDED"
             echo "podman_basic_ok=true" >> $GITHUB_OUTPUT
           else
-            echo "✗ Podman continuity failed"
+            echo "✗ Podman basic FAILED"
             exit 1
           fi
 
@@ -373,20 +418,17 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-
           sudo podman rm -f looper-p2 2>/dev/null || true
           sudo podman run -d --name looper-p2 --runtime=runc docker.io/library/busybox \
             sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
           sleep 3
-
           sudo podman container checkpoint --runtime=runc \
-            --export=/tmp/podman-fix.tar.gz looper-p2
-          ls -lh /tmp/podman-fix.tar.gz
-
+            --export=/tmp/podman-ex.tar.gz looper-p2
+          ls -lh /tmp/podman-ex.tar.gz
           sudo podman container restore --runtime=runc \
-            --import=/tmp/podman-fix.tar.gz --name looper-p2-restored
+            --import=/tmp/podman-ex.tar.gz --name looper-p2-restored
           sleep 2
-          sudo podman logs looper-p2-restored | tail -6
+          sudo podman logs looper-p2-restored | tail -5
           echo "✓ Podman export/import SUCCEEDED"
           echo "podman_export_ok=true" >> $GITHUB_OUTPUT
 
@@ -395,12 +437,10 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-
           sudo podman rm -f looper-p3 2>/dev/null || true
           sudo podman run -d --name looper-p3 --runtime=runc docker.io/library/busybox \
             sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
           sleep 2
-
           sudo podman container checkpoint --runtime=runc --leave-running looper-p3
           if sudo podman ps --filter name=looper-p3 --format '{{.Status}}' | grep -q Up; then
             echo "✓ Podman --leave-running SUCCEEDED"
@@ -415,12 +455,10 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-
           sudo podman rm -f looper-tcp 2>/dev/null || true
           sudo podman run -d --name looper-tcp --runtime=runc docker.io/library/busybox \
             sh -c 'while true; do echo -e "HTTP/1.1 200 OK\r\n\r\nOK" | nc -l -p 8080; done'
           sleep 2
-
           if sudo podman container checkpoint --runtime=runc --tcp-established looper-tcp; then
             echo "✓ Podman TCP SUCCEEDED"
             echo "podman_tcp_ok=true" >> $GITHUB_OUTPUT
@@ -429,23 +467,23 @@ jobs:
             exit 0
           fi
 
-      # ================================================================
+      # ----------------------------------------------------------------
       # Cleanup + Final Verdict
-      # ================================================================
+      # ----------------------------------------------------------------
       - name: Cleanup
         if: always()
         run: |
           sudo podman rm -f looper-p1 looper-p2 looper-p2-restored looper-p3 looper-tcp 2>/dev/null || true
-          docker rm -f looper-d1 looper-d2 looper-d3 looper-d4 2>/dev/null || true
-          rm -rf /tmp/criu-raw /tmp/podman-fix.tar.gz /tmp/docker-ckpts /tmp/shm_test /tmp/shm.out /tmp/criu-lock 2>/dev/null || true
+          docker rm -f looper-d0 looper-d2 looper-d3 looper-d4 looper-d5 looper-d6 looper-d7 2>/dev/null || true
+          rm -rf /tmp/criu-raw /tmp/podman-ex.tar.gz /tmp/docker-ckpts /tmp/shm_test /tmp/shm.out /tmp/criu-lock 2>/dev/null || true
           pkill -f "raw-basic.marker" 2>/dev/null || true
           pkill -f shm_test 2>/dev/null || true
 
-      - name: "FINAL VERDICT – Fix Attempt Results"
+      - name: "FINAL VERDICT – Exhaustive Fallbacks"
         if: always()
         run: |
           echo "================================================================"
-          echo " FULL CRIU FIX ATTEMPT – FINAL VERDICT"
+          echo " CRIU EXHAUSTIVE FALLBACKS – FINAL VERDICT"
           echo "================================================================"
           echo
           echo "Environment:"
@@ -459,12 +497,15 @@ jobs:
           echo "  Shared memory + locks      : ${{ steps.raw_shm.outputs.raw_shm_ok || 'FAILED' }}"
           echo "  Established TCP            : ${{ steps.raw_tcp.outputs.raw_tcp_ok || 'soft-fail' }}"
           echo
-          echo "---------------- PATH 2: Docker (aggressive workarounds) ----"
+          echo "---------------- PATH 2: Docker fallbacks -------------------"
           echo "  Checkpoint create          : ${{ steps.docker_create.outputs.docker_create_ok || 'FAILED' }}"
-          echo "  Restore #1 (normal)        : ${{ steps.docker_restore1.outputs.docker_restore1_ok || 'FAILED' }}"
-          echo "  Restore #2 (--network=host): ${{ steps.docker_restore2.outputs.docker_restore2_ok || 'FAILED' }}"
-          echo "  Restore #3 (custom dir)    : ${{ steps.docker_restore3.outputs.docker_restore3_ok || 'FAILED' }}"
-          echo "  --leave-running            : ${{ steps.docker_leave.outputs.docker_leave_ok || 'FAILED' }}"
+          echo "  Fallback 1 – normal        : ${{ steps.docker_f1.outputs.docker_f1_ok || 'FAILED' }}"
+          echo "  Fallback 2 – --network=host: ${{ steps.docker_f2.outputs.docker_f2_ok || 'FAILED' }}"
+          echo "  Fallback 3 – custom dir    : ${{ steps.docker_f3.outputs.docker_f3_ok || 'FAILED' }}"
+          echo "  Fallback 4 – leave then restore : ${{ steps.docker_f4.outputs.docker_f4_ok || 'FAILED' }}"
+          echo "  Fallback 5 – --network=none: ${{ steps.docker_f5.outputs.docker_f5_ok || 'FAILED' }}"
+          echo "  Fallback 6 – content cleanup: ${{ steps.docker_f6.outputs.docker_f6_ok || 'FAILED' }}"
+          echo "  --leave-running only       : ${{ steps.docker_leave.outputs.docker_leave_ok || 'FAILED' }}"
           echo
           echo "---------------- PATH 3: Podman + runc ----------------------"
           echo "  Basic C/R + continuity     : ${{ steps.podman_basic.outputs.podman_basic_ok || 'FAILED' }}"
@@ -473,8 +514,8 @@ jobs:
           echo "  TCP established            : ${{ steps.podman_tcp.outputs.podman_tcp_ok || 'soft-fail' }}"
           echo
           echo "================================================================"
-          echo " Summary:"
-          echo "  • Raw CRIU and Podman remain fully reliable"
-          echo "  • Docker restore is still broken despite multiple workarounds"
-          echo "  • Recommendation: Prefer Podman + runc for container C/R"
+          echo " Summary Recommendation:"
+          echo "  1. Podman + runc          → Best full container C/R"
+          echo "  2. Raw privileged CRIU    → Best process-level"
+          echo "  3. Docker experimental    → Create + leave-running only"
           echo "================================================================"
